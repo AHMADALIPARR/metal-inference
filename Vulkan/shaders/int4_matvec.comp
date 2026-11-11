@@ -1,0 +1,95 @@
+#version 450
+// int4_matvec.comp — manual GLSL port of the Scheme-B INT4 matvec:
+// the dequantization of int4_transformer.metal dequantNibble applied
+// in the matvec shape of Transformer.metal quantized_matvec
+// (one output row per workgroup; serial math, parallel reduction).
+//
+//   y[r] = sum_c (nib(r,c) - 7.5) * scale[group(c)] * x[c]
+//
+// ABI (byte-exact with the Metal layout):
+//   binding 0: packed weights, uint array; byte order inside each
+//              uint is little-endian lane order — byte k of the row
+//              holds lanes 2k (low nibble) and 2k+1 (high nibble),
+//              identical to the Metal uchar array.
+//   binding 1: scale slots, uint array; slot g holds one half2 —
+//              low 16 bits are .x = the group scale (FP16 bits),
+//              high 16 bits (.y) are carried and never read.
+//   binding 2: input x, float array (int4_transformer.metal's
+//              qkvProjection consumes float* activations).
+//   binding 3: output y, float array.
+//   push constants: { in_dim, out_dim }.
+//   spec constants: 0 = workgroup size (threads per row),
+//                   1 = group size (fixed 32 by the ABI; exposed so
+//                       reflection can verify it, must remain 32).
+//
+// Reduction order differs from the serial Metal loop: each thread
+// accumulates a strided partial sum, then a shared-memory tree
+// reduces. FP32 addition is not associative; comparisons against
+// the CPU oracle use the documented tolerance (docs/PHASE_B.md).
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const uint GROUP = 32;
+
+layout(set = 0, binding = 0) readonly buffer Packed { uint packed_[]; };
+layout(set = 0, binding = 1) readonly buffer Scales { uint scales_[]; };
+layout(set = 0, binding = 2) readonly buffer X      { float x_[]; };
+layout(set = 0, binding = 3) writeonly buffer Y    { float y_[]; };
+
+layout(push_constant) uniform Push {
+  uint in_dim;
+  uint out_dim;
+} pc;
+
+shared float partial_[256];
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    // subnormal: normalize by shifting (values here are scales;
+    // exact loop mirrors the CPU oracle's construction)
+    float v = float(frac) * (1.0 / 16777216.0); // frac * 2^-24
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) {
+    return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  }
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+uint nibble_at(uint row_byte_base, uint lane) {
+  uint byte_idx = row_byte_base + (lane >> 1);
+  uint word = packed_[byte_idx >> 2];
+  uint byte_val = (word >> ((byte_idx & 3u) * 8u)) & 0xFFu;
+  return (lane & 1u) == 1u ? (byte_val >> 4) : (byte_val & 0x0Fu);
+}
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  if (row >= pc.out_dim) return;
+  uint tid = gl_LocalInvocationID.x;
+  uint nthreads = gl_WorkGroupSize.x;
+  uint row_bytes = (pc.in_dim + 1u) / 2u;
+  uint row_byte_base = row * row_bytes;
+  uint groups_per_row = (pc.in_dim + GROUP - 1u) / GROUP;
+  uint scale_base = row * groups_per_row;
+
+  float acc = 0.0;
+  for (uint c = tid; c < pc.in_dim; c += nthreads) {
+    uint nib = nibble_at(row_byte_base, c);
+    uint slot = scales_[scale_base + c / GROUP];
+    float scale = half_to_float(slot & 0xFFFFu);
+    float w = (float(nib) - 7.5) * scale;
+    acc += w * x_[c];
+  }
+  partial_[tid] = acc;
+  barrier();
+  for (uint stride = nthreads >> 1; stride > 0u; stride >>= 1) {
+    if (tid < stride) partial_[tid] += partial_[tid + stride];
+    barrier();
+  }
+  if (tid == 0u) y_[row] = partial_[0];
+}

@@ -1,0 +1,31 @@
+#version 450
+// embedding.comp — manual GLSL port of Sources/Kernels/embedding.metal
+// kernel `embedding` (single-token form):
+//   if (tid < hidden) output[tid] = table[token_ids[0] * hidden + tid]
+//
+// ABI mapping (documented in docs/PHASE_B.md):
+//   Metal buffer(0) half*  table     -> set 0 binding 0, uint array of
+//                                       FP16 bit patterns (one per slot)
+//   Metal buffer(1) uint*  token_ids -> set 0 binding 1
+//   Metal buffer(2) half*  output    -> set 0 binding 2 (FP16 bits)
+//   Metal buffer(3) ModelConfig      -> push constants { hidden }
+// Values move as FP16 bit patterns: the copy is bitwise, so no
+// floating-point conversion exists in this kernel to get wrong.
+
+layout(local_size_x_id = 0) in; // specialization constant 0: workgroup size
+
+layout(set = 0, binding = 0) readonly buffer Table   { uint table_[]; };
+layout(set = 0, binding = 1) readonly buffer Tokens  { uint tokens_[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { uint output_[]; };
+
+layout(push_constant) uniform Push {
+  uint hidden;
+} pc;
+
+void main() {
+  uint tid = gl_GlobalInvocationID.x;
+  if (tid < pc.hidden) {
+    uint token = tokens_[0];
+    output_[tid] = table_[token * pc.hidden + tid];
+  }
+}
