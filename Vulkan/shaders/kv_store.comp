@@ -1,0 +1,43 @@
+#version 450
+// kv_store.comp — manual GLSL port of Sources/Kernels/kv_cache.metal
+// kernel `kv_store_layer`:
+//   offset = layer*(context*kv_heads*head_dim)
+//          + ((pos*kv_heads) + kv_head)*head_dim + dim
+//   k_cache[offset] = k[tid]; v_cache[offset] = v[tid]
+// (The non-layer sibling `kv_store` is this kernel with layer 0.)
+// kv_offset() is Sources/Common/types.h.
+//
+// ABI: FP16 values as uint bit patterns.
+//   binding 0: k (FP16 bits), 1: v (FP16 bits),
+//   binding 2: k_cache (FP16 bits), 3: v_cache (FP16 bits)
+//   push constants: { layer, position, kv_heads, head_dim, context }
+//   (20 bytes); spec constant 0: workgroup size.
+// Sync: none — each kv element is written by exactly one thread.
+// One thread per kv element (kv_heads*head_dim lanes).
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer K      { uint k_[]; };
+layout(set = 0, binding = 1) readonly buffer V      { uint v_[]; };
+layout(set = 0, binding = 2) buffer KCache          { uint kcache_[]; };
+layout(set = 0, binding = 3) buffer VCache          { uint vcache_[]; };
+
+layout(push_constant) uniform Push {
+  uint layer;
+  uint position;
+  uint kv_heads;
+  uint head_dim;
+  uint context;
+} pc;
+
+void main() {
+  uint tid = gl_GlobalInvocationID.x;
+  uint kv_total = pc.kv_heads * pc.head_dim;
+  if (tid >= kv_total) return;
+  uint kv_head = tid / pc.head_dim;
+  uint dim = tid % pc.head_dim;
+  uint layer_stride = pc.context * pc.kv_heads * pc.head_dim;
+  uint base = pc.layer * layer_stride;
+  uint offset = base + ((pc.position * pc.kv_heads) + kv_head) * pc.head_dim + dim;
+  kcache_[offset] = k_[tid];
+  vcache_[offset] = v_[tid];
+}

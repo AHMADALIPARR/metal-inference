@@ -1,0 +1,87 @@
+#version 450
+// lora_delta.comp — manual GLSL port of Sources/Kernels/
+// lora_delta.metal kernel `apply_lora_delta`:
+//   tmp[r] = sum_k A[r*K + k] * X[m*K + k]
+//   Y[m*N + n] += scale * sum_r B[n*rank + r] * tmp[r]
+// ABI LIMIT (from the Metal source): the kernel keeps tmp in a
+// stack array `float tmp[64]`; rank > 64 cannot run. This shader
+// returns without writing when rank > 64, and graph validation
+// rejects rank > 64 before dispatch — the limit is enforced in
+// both places, never silently exceeded.
+//
+// ABI: FP16 values as uint bit patterns.
+//   binding 0: A (FP16 bits, [rank][K]), 1: B (FP16 bits, [N][rank]),
+//   binding 2: X (FP16 bits, [M][K]), 3: Y (FP16 bits, [M][N], RMW)
+//   push constants: { rank, K, N, scale }  (16 bytes)
+//   spec constant 0: workgroup size.
+// 2-D dispatch: x = n (0..N-1), y = m (row). Sync: none — each
+// (m, n) is written by exactly one thread.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer A { uint a_[]; };
+layout(set = 0, binding = 1) readonly buffer B { uint b_[]; };
+layout(set = 0, binding = 2) readonly buffer X { uint x_[]; };
+layout(set = 0, binding = 3) buffer Y { uint y_[]; };
+
+layout(push_constant) uniform Push {
+  uint rank;
+  uint K;
+  uint N;
+  float scale;
+} pc;
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    float v = float(frac) * (1.0 / 16777216.0);
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+uint float_to_half(float f) {
+  uint bits = floatBitsToUint(f);
+  uint sign = (bits >> 16) & 0x8000u;
+  int exp = int((bits >> 23) & 0xFFu) - 112;
+  uint frac = bits & 0x7FFFFFu;
+  if (((bits >> 23) & 0xFFu) == 0xFFu) return sign | 0x7C00u | (frac != 0u ? 0x200u : 0u);
+  if (exp >= 31) return sign | 0x7C00u;
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    frac |= 0x800000u;
+    int shift = 14 - exp;
+    uint hf = frac >> shift;
+    uint rem = frac & ((1u << shift) - 1u);
+    uint halfway = 1u << (shift - 1);
+    if (rem > halfway || (rem == halfway && (hf & 1u) != 0u)) hf += 1u;
+    return sign | hf;
+  }
+  uint outh = sign | (uint(exp) << 10) | (frac >> 13);
+  uint rem = frac & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (outh & 1u) != 0u)) outh += 1u;
+  return outh;
+}
+
+void main() {
+  uint n = gl_GlobalInvocationID.x;
+  uint m = gl_GlobalInvocationID.y;
+  if (n >= pc.N) return;
+  if (pc.rank > 64u) return; // ABI limit: tmp[64] in the Metal source
+  float tmp[64];
+  for (uint r = 0; r < pc.rank; ++r) {
+    float acc = 0.0;
+    for (uint k = 0; k < pc.K; ++k)
+      acc += half_to_float(a_[r * pc.K + k]) * half_to_float(x_[m * pc.K + k]);
+    tmp[r] = acc;
+  }
+  float delta = 0.0;
+  for (uint r = 0; r < pc.rank; ++r)
+    delta += half_to_float(b_[n * pc.rank + r]) * tmp[r];
+  uint idx = m * pc.N + n;
+  y_[idx] = float_to_half(half_to_float(y_[idx]) + delta * pc.scale);
+}

@@ -1,0 +1,42 @@
+#version 450
+// softmax.comp — manual GLSL port of Sources/Kernels/attention.metal
+// kernel `stable_softmax`:
+//   len = offset + 1; max over the first len entries; exp(x - max);
+//   divide by the sum (floor 1e-8); zero entries len..length.
+// One thread per head (only local thread 0 works, matching the
+// Metal kernel's one-thread-per-head shape). Serial by design:
+// a head's softmax is a sequential scan, and the repo's own kernel
+// does it in one thread.
+//
+// ABI: FP32 scores, in place.
+//   binding 0: scores (float, [heads][length], read/write)
+//   push constants: { heads, len, offset }  (12 bytes)
+//   spec constant 0: workgroup size (only thread 0 works).
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) buffer Scores { float s_[]; };
+
+layout(push_constant) uniform Push {
+  uint heads;
+  uint len;
+  uint offset;
+} pc;
+
+void main() {
+  if (gl_LocalInvocationID.x != 0u) return;
+  uint head = gl_WorkGroupID.x;
+  if (head >= pc.heads) return;
+  uint base = head * pc.len;
+  uint len = pc.offset + 1u;
+  float maxv = -1.0e30;
+  for (uint i = 0; i < len; ++i) maxv = max(maxv, s_[base + i]);
+  float sum = 0.0;
+  for (uint i = 0; i < len; ++i) {
+    float e = exp(s_[base + i] - maxv);
+    s_[base + i] = e;
+    sum += e;
+  }
+  float inv = 1.0 / max(sum, 1.0e-8);
+  for (uint i = 0; i < len; ++i) s_[base + i] *= inv;
+  for (uint i = len; i < pc.len; ++i) s_[base + i] = 0.0;
+}

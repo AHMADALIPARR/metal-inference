@@ -38,6 +38,25 @@ struct DeviceInfo {
   uint32_t api_version = 0;
 };
 
+// Queried compute capabilities of the first compute-capable device.
+// Values come from VkPhysicalDeviceProperties, never from an assumed
+// vendor or model. query_capabilities returns a non-Ok status
+// (LoaderMissing / NoPhysicalDevice / ...) when no device can be
+// queried; callers must treat that as "unknown", not as zeros.
+struct DeviceCaps {
+  uint32_t max_workgroup_count_x = 0;
+  uint32_t max_workgroup_count_y = 0;
+  uint32_t max_workgroup_count_z = 0;
+  uint32_t max_workgroup_invocations = 0;
+  uint32_t max_workgroup_size_x = 0;
+  uint32_t max_workgroup_size_y = 0;
+  uint32_t max_workgroup_size_z = 0;
+  uint32_t max_push_constants_size = 0;
+  uint32_t max_shared_memory_per_workgroup = 0;
+};
+
+Status query_capabilities(DeviceCaps& out);
+
 struct BufferSpec {
   std::vector<uint8_t> initial; // uploaded before dispatch; empty = uninitialized
   size_t size = 0;              // if initial non-empty, size is ignored (= initial.size())

@@ -1,0 +1,71 @@
+#version 450
+// gqa_online.comp — manual GLSL port of Sources/Kernels/
+// int4_transformer.metal kernel `gqaAttention` (float activations,
+// online softmax with the rescaling correction):
+//   rep = H/G; kvHead = head/rep; kvStride = G*dh; kvLen = qPos+1
+//   per position p: score = rsqrt(dh) * dot(q, k[p]); the running
+//   max m, sum l and value accumulator are rescaled by
+//   exp(m - newM) at each step; out = accV / l.
+// This is the numerically distinct sibling of gqa_attention.comp
+// (two-pass max/sum over the FP16 strided cache). Both compute the
+// same softmax; the online form is the one the Scheme-B stack uses.
+//
+// ABI: float buffers throughout.
+//   binding 0: qkv (float, [qPos][qkv_hidden]),
+//   binding 1: K cache (float, [pos][G*dh]),
+//   binding 2: V cache (float, same layout),
+//   binding 3: attnOut (float, [qPos][hidden])
+//   push constants: { num_heads, num_kv_heads, head_dim,
+//                     qkv_hidden, hidden }  (20 bytes)
+//   spec constant 0: workgroup size.
+// One thread per (head, qPos): global id = qPos*num_heads + head.
+// accV is a 128-lane local array (head_dim <= 128, the repo max).
+// Sync: none — each output lane is written by exactly one thread.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer QKV { float qkv_[]; };
+layout(set = 0, binding = 1) readonly buffer Kc  { float kc_[]; };
+layout(set = 0, binding = 2) readonly buffer Vc  { float vc_[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float out_[]; };
+
+layout(push_constant) uniform Push {
+  uint num_heads;
+  uint num_kv_heads;
+  uint head_dim;
+  uint qkv_hidden;
+  uint hidden;
+} pc;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  uint head = gid % pc.num_heads;
+  uint q_pos = gid / pc.num_heads;
+  uint rep = pc.num_heads / pc.num_kv_heads;
+  uint kv_head = head / rep;
+  uint kv_stride = pc.num_kv_heads * pc.head_dim;
+  uint kv_len = q_pos + 1u;
+  uint q_base = q_pos * pc.qkv_hidden + head * pc.head_dim;
+  float m = -1.0 / 0.0;
+  float l = 0.0;
+  float accV[128];
+  for (uint i = 0; i < pc.head_dim; ++i) accV[i] = 0.0;
+  float scale = inversesqrt(float(pc.head_dim));
+  for (uint p = 0; p < kv_len; ++p) {
+    uint k_base = p * kv_stride + kv_head * pc.head_dim;
+    float s = 0.0;
+    for (uint i = 0; i < pc.head_dim; ++i)
+      s += qkv_[q_base + i] * kc_[k_base + i];
+    s *= scale;
+    float newM = max(m, s);
+    float corr = exp(m - newM);
+    float pexp = exp(s - newM);
+    l = l * corr + pexp;
+    for (uint i = 0; i < pc.head_dim; ++i)
+      accV[i] = accV[i] * corr + pexp * vc_[k_base + i];
+    m = newM;
+  }
+  float invL = 1.0 / l;
+  uint o_base = q_pos * pc.hidden + head * pc.head_dim;
+  for (uint i = 0; i < pc.head_dim; ++i)
+    out_[o_base + i] = accV[i] * invL;
+}

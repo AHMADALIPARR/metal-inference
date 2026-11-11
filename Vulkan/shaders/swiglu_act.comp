@@ -1,0 +1,31 @@
+#version 450
+// swiglu_act.comp — manual GLSL port of Sources/Kernels/
+// int4_transformer.metal kernel `swigluFFN` (elementwise form):
+//   act[i] = silu(gate[i]) * up[i],  silu(x) = x / (1 + exp(-x))
+// (Note: this kernel's silu has NO clamp; the mlp.metal silu
+// clamps to [-80, 80] first. The two forms differ for |x| > 80 —
+// exp(-x) underflows to 0 in both cases for x > 80, and for
+// x < -80 both give ~0; the difference is below float precision
+// for the values that occur, but it is recorded here rather than
+// silently unified.)
+//
+// ABI: float buffers.
+//   binding 0: gate (float), 1: up (float), 2: act (float)
+//   push constants: { intermediate }  (4 bytes)
+//   spec constant 0: workgroup size. One thread per lane.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer Gate { float gate_[]; };
+layout(set = 0, binding = 1) readonly buffer Up   { float up_[]; };
+layout(set = 0, binding = 2) writeonly buffer Act { float act_[]; };
+
+layout(push_constant) uniform Push {
+  uint intermediate;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.intermediate) return;
+  float g = gate_[i];
+  act_[i] = (g / (1.0 + exp(-g))) * up_[i];
+}

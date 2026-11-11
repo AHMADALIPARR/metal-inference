@@ -1,0 +1,52 @@
+#version 450
+// lora_up.comp — manual GLSL port of Sources/Kernels/
+// int4_transformer.metal kernel `loraUp`:
+//   y[seq*outDim + out] += alphaOverRank *
+//                          sum_i z[seq*r + i] * B[out*r + i]
+// B is FP16 (bit patterns), z and y are float; y is read-modify-
+// written, so the dispatch must not alias two threads to one y
+// lane (it doesn't: one thread per (seq, out)).
+//
+// ABI:
+//   binding 0: z (float, [seq][rank]),
+//   binding 1: B (FP16 bits, [out_dim][rank]),
+//   binding 2: y (float, [seq][out_dim], read/write)
+//   push constants: { out_dim, rank, alpha_over_rank }  (12 bytes)
+//   spec constant 0: workgroup size.
+// 2-D dispatch: x = output index, y = sequence index. Sync: none.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer Z { float z_[]; };
+layout(set = 0, binding = 1) readonly buffer B { uint b_[]; };
+layout(set = 0, binding = 2) buffer Y { float y_[]; };
+
+layout(push_constant) uniform Push {
+  uint out_dim;
+  uint rank;
+  float alpha_over_rank;
+} pc;
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    float v = float(frac) * (1.0 / 16777216.0);
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+void main() {
+  uint o = gl_GlobalInvocationID.x;
+  uint seq = gl_GlobalInvocationID.y;
+  if (o >= pc.out_dim) return;
+  float acc = 0.0;
+  for (uint i = 0; i < pc.rank; ++i)
+    acc += z_[seq * pc.rank + i] * half_to_float(b_[o * pc.rank + i]);
+  uint idx = seq * pc.out_dim + o;
+  y_[idx] += pc.alpha_over_rank * acc;
+}

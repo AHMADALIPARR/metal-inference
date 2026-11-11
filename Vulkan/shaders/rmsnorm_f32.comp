@@ -1,0 +1,48 @@
+#version 450
+// rmsnorm_f32.comp — manual GLSL port of Sources/Kernels/
+// int4_transformer.metal kernel `rmsNorm` (float activations):
+//   rms = rsqrt(mean(x^2) + 1e-6);  y[i] = x[i] * rms * gamma[i]
+// Epsilon is FIXED at 1e-6 in that kernel (not a config value);
+// the Metal source also reduces through simd quad sums and a
+// threadgroup array — this port uses the same shared-memory tree
+// reduction shape as rmsnorm.comp. Same math; FP32 summation order
+// differs from the Metal quad reduction.
+//
+// ABI: float buffers throughout.
+//   binding 0: x (float), binding 1: gamma (float),
+//   binding 2: y (float, write-only)
+//   push constants: { hidden:uint }  (4 bytes)
+//   spec constant 0: workgroup size (threads per token row, <= 256)
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer X     { float x_[]; };
+layout(set = 0, binding = 1) readonly buffer Gamma { float gamma_[]; };
+layout(set = 0, binding = 2) writeonly buffer Y    { float y_[]; };
+
+layout(push_constant) uniform Push {
+  uint hidden;
+} pc;
+
+shared float partial_[256];
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint nthreads = gl_WorkGroupSize.x;
+  uint base = row * pc.hidden;
+  float acc = 0.0;
+  for (uint i = tid; i < pc.hidden; i += nthreads) {
+    float v = x_[base + i];
+    acc += v * v;
+  }
+  partial_[tid] = acc;
+  barrier();
+  for (uint stride = nthreads >> 1; stride > 0u; stride >>= 1) {
+    if (tid < stride) partial_[tid] += partial_[tid + stride];
+    barrier();
+  }
+  float rms = inversesqrt(partial_[0] / float(pc.hidden) + 1.0e-6);
+  for (uint i = tid; i < pc.hidden; i += nthreads) {
+    y_[base + i] = x_[base + i] * rms * gamma_[base + i];
+  }
+}

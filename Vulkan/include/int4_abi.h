@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include "tensor_abi.h"
 
 namespace int4abi {
 
@@ -77,5 +78,45 @@ void quantize_row(const float* w, uint32_t in_dim, const uint16_t* group_scales,
 // order): y[r] = sum_c dequant(w[r,c]) * x[c]. x and y are FP32.
 void matvec(const uint8_t* packed, const uint32_t* scale_slots,
             const float* x, float* y, uint32_t in_dim, uint32_t out_dim);
+
+// ---- Phase C: the other two schemes (separate decode paths) ----
+// Signed-nibble mapping shared by A and C: nib >= 8 -> nib - 16.
+inline int signed_nibble_value(uint32_t nib) {
+  int v = (int)nib;
+  return (v >= 8) ? (v - 16) : v;
+}
+
+// Scheme A: w = signed_nibble * scale[row]. Scales are a flat
+// half* array, one FP16 per row. packed is the whole weight blob;
+// row_bytes = packed_row_bytes(in_dim).
+float dequant_a_at(const uint8_t* packed, const uint16_t* row_scales,
+                   uint32_t row, uint32_t lane, uint32_t in_dim);
+// Scheme C: w = signed_nibble * scale[row*(in_dim/64) + lane/64].
+// Scales are a flat half* array, one FP16 per group of 64.
+float dequant_c_at(const uint8_t* packed, const uint16_t* group_scales,
+                   uint32_t row, uint32_t lane, uint32_t in_dim);
+
+// Quantizers for A and C (defined by the oracle, as in Phase B:
+// the repo fixes no quantizer). Signed value v in [-8, 7] stored
+// as nib = v & 0xF. A takes one scale per row; C takes one scale
+// per group of 64. Pad nibbles in a tail group are zero-filled.
+void quantize_row_a(const float* w, uint32_t in_dim, uint16_t row_scale,
+                    uint8_t* packed_out);
+void quantize_row_c(const float* w, uint32_t in_dim, const uint16_t* group_scales,
+                    uint8_t* packed_out);
+
+// Format-selected matvec. `format` selects the decode path AND the
+// scale layout; a mismatch between the blob's real format and this
+// argument is a caller bug, caught at graph-build time by
+// check_format_compatible, not here. Scales are one flat uint16_t
+// array in every case, read as:
+//   A: scales[row]                       (one FP16 per row)
+//   B: scales[(row*groups + g) * 2]      (low half of the half2 slot
+//                                          for group g; high half unread)
+//   C: scales[row*groups + g]            (one FP16 per group of 64)
+// groups = ceil(in_dim / group_size) for B/C, 1 for A.
+void matvec_fmt(tensorabi::QuantFormat format, const uint8_t* packed,
+                const uint16_t* scales, const float* x, float* y,
+                uint32_t in_dim, uint32_t out_dim);
 
 } // namespace int4abi

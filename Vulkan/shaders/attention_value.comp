@@ -1,0 +1,79 @@
+#version 450
+// attention_value.comp — manual GLSL port of Sources/Kernels/
+// attention.metal kernel `attention_value`:
+//   out[head*head_dim + dim] =
+//     sum_{pos < offset+1} scores[head*length + pos]
+//                          * V[kv_offset(pos, head%kv_heads) + dim]
+//
+// ABI: scores FP32; V cache and output FP16 (bit patterns).
+//   binding 0: scores (float), binding 1: V cache (FP16 bits),
+//   binding 2: output (FP16 bits)
+//   push constants: { heads, kv_heads, head_dim, len, offset }
+//   (20 bytes); spec constant 0: workgroup size.
+// One thread per (head, dim). Sync: none.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer Scores { float s_[]; };
+layout(set = 0, binding = 1) readonly buffer VCache { uint vc_[]; };
+layout(set = 0, binding = 2) writeonly buffer Out   { uint o_[]; };
+
+layout(push_constant) uniform Push {
+  uint heads;
+  uint kv_heads;
+  uint head_dim;
+  uint len;
+  uint offset;
+} pc;
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    float v = float(frac) * (1.0 / 16777216.0);
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+uint float_to_half(float f) {
+  uint bits = floatBitsToUint(f);
+  uint sign = (bits >> 16) & 0x8000u;
+  int exp = int((bits >> 23) & 0xFFu) - 112;
+  uint frac = bits & 0x7FFFFFu;
+  if (((bits >> 23) & 0xFFu) == 0xFFu) return sign | 0x7C00u | (frac != 0u ? 0x200u : 0u);
+  if (exp >= 31) return sign | 0x7C00u;
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    frac |= 0x800000u;
+    int shift = 14 - exp;
+    uint hf = frac >> shift;
+    uint rem = frac & ((1u << shift) - 1u);
+    uint halfway = 1u << (shift - 1);
+    if (rem > halfway || (rem == halfway && (hf & 1u) != 0u)) hf += 1u;
+    return sign | hf;
+  }
+  uint outh = sign | (uint(exp) << 10) | (frac >> 13);
+  uint rem = frac & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (outh & 1u) != 0u)) outh += 1u;
+  return outh;
+}
+
+void main() {
+  uint tid = gl_GlobalInvocationID.x;
+  uint head = tid / pc.head_dim;
+  uint dim = tid % pc.head_dim;
+  if (head >= pc.heads) return;
+  uint kv_head = head % pc.kv_heads;
+  uint len = pc.offset + 1u;
+  float acc = 0.0;
+  for (uint pos = 0; pos < len; ++pos) {
+    float w = s_[head * pc.len + pos];
+    uint voff = ((pos * pc.kv_heads) + kv_head) * pc.head_dim + dim;
+    acc += w * half_to_float(vc_[voff]);
+  }
+  o_[head * pc.head_dim + dim] = float_to_half(acc);
+}

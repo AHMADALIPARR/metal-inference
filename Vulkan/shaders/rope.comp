@@ -1,0 +1,97 @@
+#version 450
+// rope.comp — manual GLSL port of Sources/Kernels/rope.metal kernel
+// `rope_qk` (interleaved adjacent pairs, the layout decode.metal
+// also uses):
+//   angle = pos * 10000^(-2*pair/head_dim)
+//   (x[2p], x[2p+1]) -> (x0*c - x1*s, x0*s + x1*c)
+// Q has q_heads heads; K has kv_heads heads, Q head h rotates the
+// K head h % kv_heads.
+//
+// DIVERGENCE FROM THE LITERAL METAL TEXT (found defect, see
+// docs/PHASE_C.md): rope.metal rotates the K pair inside the per-Q-
+// head loop, so with q_heads > kv_heads each K pair is rotated
+// q_heads/kv_heads times (3x at the repo defaults). decode.metal
+// rotates each K head once. This port rotates each K pair ONCE
+// (only the threads whose head index is itself a KV head touch K),
+// matching decode.metal and the evident intent.
+//
+// ABI: FP16 values as uint bit patterns, in-place Q and K.
+//   binding 0: Q (FP16 bits, read/write), binding 1: K (same)
+//   push constants: { pos, q_heads, kv_heads, head_dim } (16 bytes)
+//   spec constant 0: workgroup size
+// Sync: none needed — each (head, pair) is written by exactly one
+// thread, and Q/K pairs are disjoint.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) buffer Q { uint q_[]; };
+layout(set = 0, binding = 1) buffer K { uint k_[]; };
+
+layout(push_constant) uniform Push {
+  uint pos;
+  uint q_heads;
+  uint kv_heads;
+  uint head_dim;
+} pc;
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    float v = float(frac) * (1.0 / 16777216.0);
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+uint float_to_half(float f) {
+  uint bits = floatBitsToUint(f);
+  uint sign = (bits >> 16) & 0x8000u;
+  int exp = int((bits >> 23) & 0xFFu) - 112;
+  uint frac = bits & 0x7FFFFFu;
+  if (((bits >> 23) & 0xFFu) == 0xFFu) return sign | 0x7C00u | (frac != 0u ? 0x200u : 0u);
+  if (exp >= 31) return sign | 0x7C00u;
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    frac |= 0x800000u;
+    int shift = 14 - exp;
+    uint hf = frac >> shift;
+    uint rem = frac & ((1u << shift) - 1u);
+    uint halfway = 1u << (shift - 1);
+    if (rem > halfway || (rem == halfway && (hf & 1u) != 0u)) hf += 1u;
+    return sign | hf;
+  }
+  uint outh = sign | (uint(exp) << 10) | (frac >> 13);
+  uint rem = frac & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (outh & 1u) != 0u)) outh += 1u;
+  return outh;
+}
+
+void main() {
+  uint pairs_per_head = pc.head_dim / 2u;
+  uint pair_id = gl_GlobalInvocationID.x;
+  uint total_pairs = pc.q_heads * pairs_per_head;
+  if (pair_id >= total_pairs) return;
+  uint head = pair_id / pairs_per_head;
+  uint pair = pair_id % pairs_per_head;
+  uint even = pair * 2u;
+  uint odd = even + 1u;
+  float angle = float(pc.pos) * pow(10000.0, -float(2u * pair) / float(pc.head_dim));
+  float c = cos(angle);
+  float s = sin(angle);
+  uint qb = head * pc.head_dim;
+  float q0 = half_to_float(q_[qb + even]);
+  float q1 = half_to_float(q_[qb + odd]);
+  q_[qb + even] = float_to_half(q0 * c - q1 * s);
+  q_[qb + odd] = float_to_half(q0 * s + q1 * c);
+  if (head < pc.kv_heads) {
+    uint kb = head * pc.head_dim;
+    float k0 = half_to_float(k_[kb + even]);
+    float k1 = half_to_float(k_[kb + odd]);
+    k_[kb + even] = float_to_half(k0 * c - k1 * s);
+    k_[kb + odd] = float_to_half(k0 * s + k1 * c);
+  }
+}

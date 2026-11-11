@@ -1,0 +1,47 @@
+#version 450
+// lora_down.comp — manual GLSL port of Sources/Kernels/
+// int4_transformer.metal kernel `loraDown`:
+//   z[seq*r + ri] = sum_i x[seq*inDim + i] * A[ri*inDim + i]
+// A is FP16 (bit patterns), x and z are float.
+//
+// ABI:
+//   binding 0: x (float, [seq][in_dim]),
+//   binding 1: A (FP16 bits, [rank][in_dim]),
+//   binding 2: z (float, [seq][rank], write-only)
+//   push constants: { in_dim, rank }  (8 bytes)
+//   spec constant 0: workgroup size.
+// 2-D dispatch: x = rank index, y = sequence index. Sync: none.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x_[]; };
+layout(set = 0, binding = 1) readonly buffer A { uint a_[]; };
+layout(set = 0, binding = 2) writeonly buffer Z { float z_[]; };
+
+layout(push_constant) uniform Push {
+  uint in_dim;
+  uint rank;
+} pc;
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    float v = float(frac) * (1.0 / 16777216.0);
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+void main() {
+  uint ri = gl_GlobalInvocationID.x;
+  uint seq = gl_GlobalInvocationID.y;
+  if (ri >= pc.rank) return;
+  float acc = 0.0;
+  for (uint i = 0; i < pc.in_dim; ++i)
+    acc += x_[seq * pc.in_dim + i] * half_to_float(a_[ri * pc.in_dim + i]);
+  z_[seq * pc.rank + ri] = acc;
+}

@@ -1,14 +1,22 @@
-// vk_dispatch — Phase B dispatch CLI.
+// vk_dispatch — Phase B dispatch CLI, extended in Phase C.
 //   vk_dispatch list
+//   vk_dispatch caps                (queried device capabilities)
+//   vk_dispatch graph [layers]      (build + validate the forward graph)
 //   vk_dispatch embedding <embedding.spv>
 //   vk_dispatch matvec    <int4_matvec.spv>
 // Exit codes: 0 = executed and verified, 1 = executed but mismatch
 // or hard error, 3 = BLOCKED (no loader / no device). BLOCKED is a
 // report, not a pass: nothing falls back to CPU in this tool.
+// The graph mode builds and validates the command graph only; it
+// does not dispatch anything, and a validated graph is not an
+// executed inference pass.
 #include "vulkan_runtime.h"
 #include "int4_abi.h"
+#include "tensor_abi.h"
+#include "command_graph.h"
 #include "case_data.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <fstream>
@@ -54,6 +62,45 @@ int main(int argc, char** argv) {
     for (auto& d : devs)
       printf("DEVICE: %s [%s] api %u.%u\n", d.name.c_str(), type_name(d.type),
              (d.api_version >> 22) & 0x3FF, (d.api_version >> 12) & 0x3FF);
+    return 0;
+  }
+  if (mode == "caps") {
+    vkrun::DeviceCaps caps;
+    vkrun::Status s = vkrun::query_capabilities(caps);
+    if (!s.ok()) return report_blocked(s);
+    printf("CAPS max_workgroup_count %u %u %u\n", caps.max_workgroup_count_x,
+           caps.max_workgroup_count_y, caps.max_workgroup_count_z);
+    printf("CAPS max_workgroup_invocations %u\n", caps.max_workgroup_invocations);
+    printf("CAPS max_workgroup_size %u %u %u\n", caps.max_workgroup_size_x,
+           caps.max_workgroup_size_y, caps.max_workgroup_size_z);
+    printf("CAPS max_push_constants %u\n", caps.max_push_constants_size);
+    printf("CAPS max_shared_memory_per_workgroup %u\n",
+           caps.max_shared_memory_per_workgroup);
+    return 0;
+  }
+  if (mode == "graph") {
+    uint32_t layers = 1;
+    if (argc >= 3) layers = (uint32_t)std::atoi(argv[2]);
+    graph::ModelDims dims; // repo defaults (Swift): 3072/8192/24/8/128/32000/4096
+    graph::Graph g;
+    std::string why;
+    if (!graph::build_forward_graph(dims, layers, 1, g, why)) {
+      printf("FAIL graph build: %s\n", why.c_str());
+      return 1;
+    }
+    printf("GRAPH layers=%u nodes=%zu caps=%s (%s)\n", layers, g.nodes.size(),
+           g.caps_known ? "queried" : "unknown", g.caps_note.c_str());
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+      auto& n = g.nodes[i];
+      printf("  [%2zu] %-28s shader=%-16s fmt=%-24s groups=(%u,%u,%u)\n",
+             i, n.label.c_str(), n.shader.c_str(),
+             tensorabi::format_name(n.weight_format), n.groups_x, n.groups_y,
+             n.groups_z);
+    }
+    printf("GRAPH VALID: %zu nodes, all descriptors and formats checked\n",
+           g.nodes.size());
+    printf("EXECUTION: NOT ATTEMPTED — a validated graph is not an executed "
+           "inference pass; dispatch needs a Vulkan device (see list/caps)\n");
     return 0;
   }
   if (argc < 3) { fprintf(stderr, "missing spv path\n"); return 1; }

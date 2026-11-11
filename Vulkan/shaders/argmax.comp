@@ -1,0 +1,33 @@
+#version 450
+// argmax.comp — manual GLSL port of Sources/Kernels/output.metal
+// kernel `token_select`:
+//   selected[0] = argmax over logits (first maximum wins: the
+//   comparison is strict >, so ties keep the lowest index).
+// One thread does the serial scan, matching the Metal kernel's
+// tid==0 shape.
+//
+// ABI: FP32 logits in, uint selection out.
+//   binding 0: logits (float), binding 1: selected (uint)
+//   push constants: { vocab }  (4 bytes)
+//   spec constant 0: workgroup size (only thread 0 works).
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer Logits   { float l_[]; };
+layout(set = 0, binding = 1) writeonly buffer Selected { uint s_[]; };
+
+layout(push_constant) uniform Push {
+  uint vocab;
+} pc;
+
+void main() {
+  if (gl_LocalInvocationID.x != 0u) return;
+  float best = -1.0e30;
+  uint best_idx = 0u;
+  for (uint i = 0; i < pc.vocab; ++i) {
+    if (l_[i] > best) {
+      best = l_[i];
+      best_idx = i;
+    }
+  }
+  s_[0] = best_idx;
+}

@@ -1,0 +1,96 @@
+#version 450
+// rope_split.comp — manual GLSL port of the HALF-SPLIT RoPE layout
+// used by Sources/Kernels/gqa_strided.metal `rope_apply` and
+// Sources/Kernels/int4_transformer.metal `applyRoPE`:
+//   pair d rotates (x[d], x[d + head_dim/2])
+//   angle = pos * theta^(-2d/head_dim), theta = 10000 by default
+// This is a DIFFERENT layout from rope.comp (interleaved adjacent
+// pairs, rope.metal / decode.metal). The two layouts are not
+// interchangeable: a tensor rotated under one layout is garbage
+// under the other. The graph uses rope.comp; this shader ports the
+// other layout so both repo variants exist in SPIR-V.
+//
+// ABI: FP16 values as uint bit patterns, in-place Q and K.
+// Q layout: [pos][num_heads][head_dim]; K layout:
+// [pos][num_kv_heads][head_dim]. K is rotated only for h < kv_heads.
+//   binding 0: Q (FP16 bits, read/write), binding 1: K (same)
+//   push constants: { head_dim, num_heads, num_kv_heads, seq_len,
+//                     pos_offset, theta }  (24 bytes)
+//   spec constant 0: workgroup size
+// Dispatch is 3-D: x = pair d (0..head_dim/2-1), y = head,
+// z = position. Sync: none — each (pos, head, pair) is unique.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) buffer Q { uint q_[]; };
+layout(set = 0, binding = 1) buffer K { uint k_[]; };
+
+layout(push_constant) uniform Push {
+  uint head_dim;
+  uint num_heads;
+  uint num_kv_heads;
+  uint seq_len;
+  uint pos_offset;
+  float theta;
+} pc;
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    float v = float(frac) * (1.0 / 16777216.0);
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+uint float_to_half(float f) {
+  uint bits = floatBitsToUint(f);
+  uint sign = (bits >> 16) & 0x8000u;
+  int exp = int((bits >> 23) & 0xFFu) - 112;
+  uint frac = bits & 0x7FFFFFu;
+  if (((bits >> 23) & 0xFFu) == 0xFFu) return sign | 0x7C00u | (frac != 0u ? 0x200u : 0u);
+  if (exp >= 31) return sign | 0x7C00u;
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    frac |= 0x800000u;
+    int shift = 14 - exp;
+    uint hf = frac >> shift;
+    uint rem = frac & ((1u << shift) - 1u);
+    uint halfway = 1u << (shift - 1);
+    if (rem > halfway || (rem == halfway && (hf & 1u) != 0u)) hf += 1u;
+    return sign | hf;
+  }
+  uint outh = sign | (uint(exp) << 10) | (frac >> 13);
+  uint rem = frac & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (outh & 1u) != 0u)) outh += 1u;
+  return outh;
+}
+
+void main() {
+  uint d = gl_GlobalInvocationID.x;
+  uint h = gl_GlobalInvocationID.y;
+  uint pos = gl_GlobalInvocationID.z + pc.pos_offset;
+  uint half_d = pc.head_dim / 2u;
+  if (d >= half_d) return;
+  if (h >= pc.num_heads) return;
+  if (pos >= pc.seq_len + pc.pos_offset) return;
+  float freq = pow(pc.theta, -2.0 * float(d) / float(pc.head_dim));
+  float ang = float(pos) * freq;
+  float c = cos(ang), s = sin(ang);
+  uint q_base = pos * pc.num_heads * pc.head_dim + h * pc.head_dim;
+  float q0 = half_to_float(q_[q_base + d]);
+  float q1 = half_to_float(q_[q_base + d + half_d]);
+  q_[q_base + d] = float_to_half(q0 * c - q1 * s);
+  q_[q_base + d + half_d] = float_to_half(q0 * s + q1 * c);
+  if (h < pc.num_kv_heads) {
+    uint k_base = pos * pc.num_kv_heads * pc.head_dim + h * pc.head_dim;
+    float k0 = half_to_float(k_[k_base + d]);
+    float k1 = half_to_float(k_[k_base + d + half_d]);
+    k_[k_base + d] = float_to_half(k0 * c - k1 * s);
+    k_[k_base + d + half_d] = float_to_half(k0 * s + k1 * c);
+  }
+}

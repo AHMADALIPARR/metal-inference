@@ -1,0 +1,38 @@
+#version 450
+// temperature_softmax.comp — manual GLSL port of Sources/Kernels/
+// output.metal kernel `temperature_softmax`:
+//   logits /= max(temperature, 1e-6); then a stable softmax over
+//   the whole vocab (max, exp, sum floored at 1e-8, normalize).
+// In place; one thread does the serial scans, matching the Metal
+// kernel's tid==0 shape.
+//
+// ABI: FP32 logits, read/write.
+//   binding 0: logits (float)
+//   push constants: { vocab, temperature }  (8 bytes)
+//   spec constant 0: workgroup size (only thread 0 works).
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) buffer Logits { float l_[]; };
+
+layout(push_constant) uniform Push {
+  uint vocab;
+  float temperature;
+} pc;
+
+void main() {
+  if (gl_LocalInvocationID.x != 0u) return;
+  float inv_temp = 1.0 / max(pc.temperature, 1.0e-6);
+  float maxv = -1.0e30;
+  for (uint i = 0; i < pc.vocab; ++i) {
+    l_[i] *= inv_temp;
+    maxv = max(maxv, l_[i]);
+  }
+  float sum = 0.0;
+  for (uint i = 0; i < pc.vocab; ++i) {
+    float e = exp(l_[i] - maxv);
+    l_[i] = e;
+    sum += e;
+  }
+  float inv = 1.0 / max(sum, 1.0e-8);
+  for (uint i = 0; i < pc.vocab; ++i) l_[i] *= inv;
+}

@@ -1,0 +1,26 @@
+#version 450
+// kv_clear.comp — manual GLSL port of Sources/Kernels/
+// int4_transformer.metal kernel `secureClearKV`:
+//   cache[gid] = 0.0 (and the Metal kernel asserts the write back).
+// The Metal kernel operates on the float KV cache of the
+// int4_transformer stack; the half-bit kv_cache.metal store/fetch
+// kernels use a different cache dtype (see docs/PHASE_C.md — a
+// repo-level dtype split, not a porting choice).
+//
+// ABI: float buffer.
+//   binding 0: cache (float, read/write)
+//   push constants: { elem_count }  (4 bytes)
+//   spec constant 0: workgroup size. Sync: none.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) buffer Cache { float cache_[]; };
+
+layout(push_constant) uniform Push {
+  uint elem_count;
+} pc;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= pc.elem_count) return;
+  cache_[gid] = 0.0;
+}

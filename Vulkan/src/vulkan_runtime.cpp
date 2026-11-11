@@ -203,6 +203,36 @@ Status list_devices(std::vector<DeviceInfo>& out) {
   return {};
 }
 
+Status query_capabilities(DeviceCaps& out) {
+  Api a;
+  Status s = load_api(a);
+  if (!s.ok()) return s;
+  VkInstance inst = VK_NULL_HANDLE;
+  s = make_instance(a, inst);
+  if (!s.ok()) return s;
+  VkPhysicalDevice phys = VK_NULL_HANDLE;
+  DeviceInfo info;
+  uint32_t qfam = 0;
+  s = pick_device(a, inst, phys, info, qfam);
+  if (!s.ok()) {
+    a.destroyInstance(inst, nullptr);
+    return s;
+  }
+  VkPhysicalDeviceProperties p{};
+  a.getProps(phys, &p);
+  out.max_workgroup_count_x = p.limits.maxComputeWorkGroupCount[0];
+  out.max_workgroup_count_y = p.limits.maxComputeWorkGroupCount[1];
+  out.max_workgroup_count_z = p.limits.maxComputeWorkGroupCount[2];
+  out.max_workgroup_invocations = p.limits.maxComputeWorkGroupInvocations;
+  out.max_workgroup_size_x = p.limits.maxComputeWorkGroupSize[0];
+  out.max_workgroup_size_y = p.limits.maxComputeWorkGroupSize[1];
+  out.max_workgroup_size_z = p.limits.maxComputeWorkGroupSize[2];
+  out.max_push_constants_size = p.limits.maxPushConstantsSize;
+  out.max_shared_memory_per_workgroup = p.limits.maxComputeSharedMemorySize;
+  a.destroyInstance(inst, nullptr);
+  return {};
+}
+
 RunResult run_compute(const RunRequest& req) {
   RunResult rr;
   Api a;

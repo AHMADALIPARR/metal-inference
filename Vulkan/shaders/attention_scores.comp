@@ -1,0 +1,61 @@
+#version 450
+// attention_scores.comp — manual GLSL port of Sources/Kernels/
+// attention.metal kernel `attention_scores`:
+//   scores[head*length + pos] =
+//     attention_scale(head_dim) * dot(q[head], k_cache[pos, head%kv_heads])
+//   attention_scale(d) = 1/sqrt(d); kv_offset(pos, kh, d, G) as in types.h.
+// NOTE: the sibling `causal_mask` kernel in the same file is a
+// no-op as written (it returns before writing whenever pos >
+// offset, the only case it would mask). It is NOT ported: causality
+// is implemented by stable_softmax's len = offset+1 plus zero tail
+// (softmax.comp). See docs/PHASE_C.md.
+//
+// ABI: FP16 Q and K cache as uint bit patterns; scores FP32.
+//   binding 0: Q (FP16 bits, [heads][head_dim]),
+//   binding 1: K cache (FP16 bits, [pos][kv_heads*head_dim]),
+//   binding 2: scores (float, [heads][length])
+//   push constants: { heads, kv_heads, head_dim, len } (16 bytes)
+//   spec constant 0: workgroup size. One thread per (head, pos).
+// Sync: none.
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer Q      { uint q_[]; };
+layout(set = 0, binding = 1) readonly buffer KCache { uint kc_[]; };
+layout(set = 0, binding = 2) writeonly buffer Scores { float s_[]; };
+
+layout(push_constant) uniform Push {
+  uint heads;
+  uint kv_heads;
+  uint head_dim;
+  uint len;
+} pc;
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    float v = float(frac) * (1.0 / 16777216.0);
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+void main() {
+  uint tid = gl_GlobalInvocationID.x;
+  uint head = tid / pc.len;
+  uint pos = tid % pc.len;
+  if (head >= pc.heads || pos >= pc.len) return;
+  uint kv_head = head % pc.kv_heads;
+  float scale = inversesqrt(float(pc.head_dim));
+  float dot = 0.0;
+  for (uint d = 0; d < pc.head_dim; ++d) {
+    float qv = half_to_float(q_[head * pc.head_dim + d]);
+    uint koff = ((pos * pc.kv_heads) + kv_head) * pc.head_dim + d;
+    dot += qv * half_to_float(kc_[koff]);
+  }
+  s_[head * pc.len + pos] = dot * scale;
+}

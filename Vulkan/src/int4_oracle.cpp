@@ -106,4 +106,87 @@ void matvec(const uint8_t* packed, const uint32_t* scale_slots,
   }
 }
 
+// ---- Phase C: Schemes A and C (separate decode paths) ----
+
+float dequant_a_at(const uint8_t* packed, const uint16_t* row_scales,
+                   uint32_t row, uint32_t lane, uint32_t in_dim) {
+  size_t row_bytes = packed_row_bytes(in_dim);
+  const uint8_t* prow = packed + (size_t)row * row_bytes;
+  uint32_t nib = nibble_at(prow, lane);
+  return (float)signed_nibble_value(nib) * half_to_float(row_scales[row]);
+}
+
+float dequant_c_at(const uint8_t* packed, const uint16_t* group_scales,
+                   uint32_t row, uint32_t lane, uint32_t in_dim) {
+  size_t row_bytes = packed_row_bytes(in_dim);
+  uint32_t groups = (in_dim + 63u) / 64u;
+  const uint8_t* prow = packed + (size_t)row * row_bytes;
+  uint32_t nib = nibble_at(prow, lane);
+  return (float)signed_nibble_value(nib) *
+         half_to_float(group_scales[(size_t)row * groups + lane / 64u]);
+}
+
+void quantize_row_a(const float* w, uint32_t in_dim, uint16_t row_scale,
+                    uint8_t* packed_out) {
+  size_t bytes = packed_row_bytes(in_dim);
+  for (size_t i = 0; i < bytes; ++i) packed_out[i] = 0;
+  float scale = half_to_float(row_scale);
+  for (uint32_t lane = 0; lane < in_dim; ++lane) {
+    long v = (scale == 0.0f) ? 0 : (long)std::nearbyint((double)w[lane] / scale);
+    if (v < -8) v = -8;
+    if (v > 7) v = 7;
+    uint8_t nib = (uint8_t)(v & 0x0F);
+    if (lane & 1u) packed_out[lane >> 1] |= (uint8_t)(nib << 4);
+    else packed_out[lane >> 1] |= nib;
+  }
+}
+
+void quantize_row_c(const float* w, uint32_t in_dim, const uint16_t* group_scales,
+                    uint8_t* packed_out) {
+  size_t bytes = packed_row_bytes(in_dim);
+  for (size_t i = 0; i < bytes; ++i) packed_out[i] = 0;
+  for (uint32_t lane = 0; lane < in_dim; ++lane) {
+    float scale = half_to_float(group_scales[lane / 64u]);
+    long v = (scale == 0.0f) ? 0 : (long)std::nearbyint((double)w[lane] / scale);
+    if (v < -8) v = -8;
+    if (v > 7) v = 7;
+    uint8_t nib = (uint8_t)(v & 0x0F);
+    if (lane & 1u) packed_out[lane >> 1] |= (uint8_t)(nib << 4);
+    else packed_out[lane >> 1] |= nib;
+  }
+}
+
+void matvec_fmt(tensorabi::QuantFormat format, const uint8_t* packed,
+                const uint16_t* scales, const float* x, float* y,
+                uint32_t in_dim, uint32_t out_dim) {
+  size_t row_bytes = packed_row_bytes(in_dim);
+  uint32_t groups_b = (in_dim + 31u) / 32u;
+  for (uint32_t r = 0; r < out_dim; ++r) {
+    const uint8_t* prow = packed + (size_t)r * row_bytes;
+    float acc = 0.0f;
+    for (uint32_t c = 0; c < in_dim; ++c) {
+      float w = 0.0f;
+      switch (format) {
+        case tensorabi::QuantFormat::A_SignedPerRow:
+          w = dequant_a_at(packed, scales, r, c, in_dim);
+          break;
+        case tensorabi::QuantFormat::B_Offset75PerGroup32: {
+          // B scales arrive as half2 slots viewed as uint16 pairs.
+          const uint32_t* slots = reinterpret_cast<const uint32_t*>(scales);
+          w = dequant_at(prow, slots + (size_t)r * groups_b, c);
+          break;
+        }
+        case tensorabi::QuantFormat::C_SignedPerGroup64:
+          w = dequant_c_at(packed, scales, r, c, in_dim);
+          break;
+        default:
+          w = 0.0f; // QuantFormat::None has no decode path; never called.
+          break;
+      }
+      acc += w * x[c];
+    }
+    y[r] = acc;
+  }
+}
+
 } // namespace int4abi

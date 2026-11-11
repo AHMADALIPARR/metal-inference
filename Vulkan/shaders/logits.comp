@@ -1,0 +1,95 @@
+#version 450
+// logits.comp — manual GLSL port of Sources/Kernels/output.metal
+// kernel `logits_i4`:
+//   logits[r] = sum_c dequant_format(lm_weight[r,c]) * hidden[c]
+// Hidden input is FP16 (bit patterns); logits output is FP32.
+// The Metal kernel uses Scheme A (dequant_i4); this port decodes
+// format-selected (fmt push constant, 1 = A, 2 = B, 3 = C) with the
+// same decode paths and scale layouts as int4_matvec_fmt.comp.
+// One workgroup per vocab row, shared-memory tree reduction.
+// Reduction order differs from the serial CPU oracle; comparisons
+// use the documented tolerance.
+//
+// ABI:
+//   binding 0: hidden (FP16 bits), binding 1: lm_weight packed (uint),
+//   binding 2: lm_scale scales (uint), binding 3: logits (float)
+//   push constants: { hidden, vocab, fmt }  (12 bytes)
+//   spec constant 0: workgroup size (threads per row)
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer Hidden { uint hidden_[]; };
+layout(set = 0, binding = 1) readonly buffer Packed { uint packed_[]; };
+layout(set = 0, binding = 2) readonly buffer Scales { uint scales_[]; };
+layout(set = 0, binding = 3) writeonly buffer Logits { float logits_[]; };
+
+layout(push_constant) uniform Push {
+  uint hidden;
+  uint vocab;
+  uint fmt;
+} pc;
+
+shared float partial_[256];
+
+float half_to_float(uint h) {
+  uint sign = (h >> 15) & 1u;
+  uint exp = (h >> 10) & 0x1Fu;
+  uint frac = h & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) return sign == 1u ? -0.0 : 0.0;
+    float v = float(frac) * (1.0 / 16777216.0);
+    return sign == 1u ? -v : v;
+  }
+  if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+  float v = (1.0 + float(frac) / 1024.0) * exp2(float(int(exp) - 15));
+  return sign == 1u ? -v : v;
+}
+
+float scale_half_at(uint idx) {
+  uint word = scales_[idx >> 1];
+  uint half_bits = ((idx & 1u) == 1u) ? (word >> 16) : (word & 0xFFFFu);
+  return half_to_float(half_bits);
+}
+
+uint nibble_at(uint row_byte_base, uint lane) {
+  uint byte_idx = row_byte_base + (lane >> 1);
+  uint word = packed_[byte_idx >> 2];
+  uint byte_val = (word >> ((byte_idx & 3u) * 8u)) & 0xFFu;
+  return (lane & 1u) == 1u ? (byte_val >> 4) : (byte_val & 0x0Fu);
+}
+
+float dequant(uint row, uint lane, uint row_byte_base) {
+  uint nib = nibble_at(row_byte_base, lane);
+  if (pc.fmt == 1u) {
+    int v = int(nib) >= 8 ? int(nib) - 16 : int(nib);
+    return float(v) * scale_half_at(row);
+  } else if (pc.fmt == 2u) {
+    uint groups = (pc.hidden + 31u) / 32u;
+    uint slot = scales_[row * groups + lane / 32u];
+    return (float(nib) - 7.5) * half_to_float(slot & 0xFFFFu);
+  } else {
+    uint groups = (pc.hidden + 63u) / 64u;
+    uint idx = row * groups + lane / 64u;
+    int v = int(nib) >= 8 ? int(nib) - 16 : int(nib);
+    return float(v) * scale_half_at(idx);
+  }
+}
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  if (row >= pc.vocab) return;
+  uint tid = gl_LocalInvocationID.x;
+  uint nthreads = gl_WorkGroupSize.x;
+  uint row_bytes = (pc.hidden + 1u) / 2u;
+  uint row_byte_base = row * row_bytes;
+  float acc = 0.0;
+  for (uint c = tid; c < pc.hidden; c += nthreads) {
+    acc += dequant(row, c, row_byte_base) * half_to_float(hidden_[c]);
+  }
+  partial_[tid] = acc;
+  barrier();
+  for (uint stride = nthreads >> 1; stride > 0u; stride >>= 1) {
+    if (tid < stride) partial_[tid] += partial_[tid + stride];
+    barrier();
+  }
+  if (tid == 0u) logits_[row] = partial_[0];
+}
