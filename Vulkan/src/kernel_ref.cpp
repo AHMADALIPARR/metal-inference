@@ -204,6 +204,10 @@ void attention_scores_ref(const float* q, const float* k_cache,
 
 void stable_softmax_ref(float* scores, uint32_t heads, uint32_t length,
                         uint32_t offset) {
+  // Sole causal enforcement in the port: len = offset+1, entries
+  // len..length zeroed. attention.metal `causal_mask` is a no-op as
+  // written and was deliberately not ported; see the "causal: future
+  // positions zeroed" regression test in test_kernel_ref.cpp.
   uint32_t len = offset + 1;
   for (uint32_t h = 0; h < heads; ++h) {
     float* row = scores + (size_t)h * length;

@@ -8,6 +8,13 @@
 // a head's softmax is a sequential scan, and the repo's own kernel
 // does it in one thread.
 //
+// DIVERGENCE (intentional, regression-tested): attention.metal
+// `causal_mask` is a no-op as written — it returns before its only
+// write, so it never masks. It was deliberately NOT ported as a
+// kernel. This kernel is the SOLE causal enforcement in the port:
+// len = offset+1 plus the zero tail. See test "causal: future
+// positions zeroed, past sums to 1" in test_kernel_ref.cpp.
+//
 // ABI: FP32 scores, in place.
 //   binding 0: scores (float, [heads][length], read/write)
 //   push constants: { heads, len, offset }  (12 bytes)

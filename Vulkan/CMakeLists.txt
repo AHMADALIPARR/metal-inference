@@ -105,6 +105,19 @@ add_custom_command(
   DEPENDS gen_kernel_golden)
 add_custom_target(kernel_golden_regen ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/kernel_golden.regen.txt)
 
+# --- graph manifests (checked-in copies are the consumer contract) ---
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_1layer.regen.json
+  COMMAND vk_dispatch manifest 1 ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_1layer.regen.json ${CMAKE_CURRENT_SOURCE_DIR}/shaders
+  DEPENDS vk_dispatch)
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_2layers.regen.json
+  COMMAND vk_dispatch manifest 2 ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_2layers.regen.json ${CMAKE_CURRENT_SOURCE_DIR}/shaders
+  DEPENDS vk_dispatch)
+add_custom_target(manifest_regen ALL DEPENDS
+  ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_1layer.regen.json
+  ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_2layers.regen.json)
+
 # --- tests ---
 add_test(NAME int4_oracle COMMAND test_int4_oracle ${GOLDEN})
 add_test(NAME kernel_ref COMMAND test_kernel_ref ${KGOLDEN})
@@ -112,6 +125,13 @@ add_test(NAME golden_reproducible
   COMMAND ${CMAKE_COMMAND} -E compare_files ${GOLDEN} ${CMAKE_CURRENT_BINARY_DIR}/int4_golden.regen.txt)
 add_test(NAME kernel_golden_reproducible
   COMMAND ${CMAKE_COMMAND} -E compare_files ${KGOLDEN} ${CMAKE_CURRENT_BINARY_DIR}/kernel_golden.regen.txt)
+add_test(NAME manifest_1layer COMMAND vk_dispatch manifest 1 ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_1layer.json ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+add_test(NAME manifest_2layers COMMAND vk_dispatch manifest 2 ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_2layers.json ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+add_test(NAME manifest_1layer_reproducible
+  COMMAND ${CMAKE_COMMAND} -E compare_files ${CMAKE_CURRENT_SOURCE_DIR}/manifests/graph_manifest_1layer.json ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_1layer.regen.json)
+add_test(NAME manifest_2layers_reproducible
+  COMMAND ${CMAKE_COMMAND} -E compare_files ${CMAKE_CURRENT_SOURCE_DIR}/manifests/graph_manifest_2layers.json ${CMAKE_CURRENT_BINARY_DIR}/graph_manifest_2layers.regen.json)
+set_tests_properties(manifest_1layer manifest_2layers PROPERTIES PASS_REGULAR_EXPRESSION "MANIFEST OK")
 foreach(shader ${ALL_SHADERS})
   add_test(NAME spirv_val_${shader} COMMAND ${SPIRV_VAL} --target-env vulkan1.2 ${CMAKE_CURRENT_BINARY_DIR}/${shader}.spv)
   add_test(NAME reflect_${shader} COMMAND check_reflection ${CMAKE_CURRENT_BINARY_DIR}/${shader}.spv ${shader})

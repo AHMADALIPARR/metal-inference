@@ -329,6 +329,46 @@ static void test_norms_rope_kv() {
     check("rope K rotated once under GQA (not 2x)",
           std::fabs(k2[0] - (float)std::cos(1.0)) < 1e-6 &&
           std::fabs(k2[1] - (float)std::sin(1.0)) < 1e-6);
+    // REGRESSION: the literal rope.metal text rotates the K pair
+    // INSIDE the per-Q-head loop, so each K pair is rotated
+    // q_heads/kv_heads times (3x at the repo defaults 24/8). The
+    // lambda below replicates that literal loop; the port rotates
+    // once (decode.metal semantics). The two must differ — if they
+    // ever agree, the fix has regressed to the literal bug.
+    auto rope_literal_metal = [](float* q, float* k, uint32_t pos,
+                                 uint32_t q_heads, uint32_t head_dim) {
+      for (uint32_t h = 0; h < q_heads; ++h) {
+        for (uint32_t pair = 0; pair < head_dim / 2; ++pair) {
+          uint32_t even = pair * 2, odd = even + 1;
+          float angle = (float)pos *
+                        std::pow(10000.0f, -((float)(2u * pair)) / (float)head_dim);
+          float c = std::cos(angle), s = std::sin(angle);
+          float q0 = q[h * head_dim + even], q1 = q[h * head_dim + odd];
+          q[h * head_dim + even] = q0 * c - q1 * s;
+          q[h * head_dim + odd] = q0 * s + q1 * c;
+          float k0 = k[even], k1 = k[odd]; // K re-rotated per Q head
+          k[even] = k0 * c - k1 * s;
+          k[odd] = k0 * s + k1 * c;
+        }
+      }
+    };
+    {
+      float ql[8] = {1, 0, 0, 0, 0, 0, 0, 0}, kl[4] = {1, 0, 0, 0};
+      rope_literal_metal(ql, kl, 1, 2, 4);
+      // 2 rotations of (1,0) by 1 rad: (cos 2, sin 2).
+      bool literal_2x = std::fabs(kl[0] - (float)std::cos(2.0)) < 1e-6 &&
+                        std::fabs(kl[1] - (float)std::sin(2.0)) < 1e-6;
+      // Corrected path (k2 above) is 1 rotation: (cos 1, sin 1).
+      bool differs = std::fabs(kl[0] - k2[0]) > 0.5f;
+      check("rope literal Metal text rotates K 2x at 2:1 heads (defect)",
+            literal_2x && differs);
+      float ql3[12] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, kl3[4] = {1, 0, 0, 0};
+      rope_literal_metal(ql3, kl3, 1, 3, 4);
+      // 3 rotations: (cos 3, sin 3) — the 24/8 default ratio.
+      check("rope literal Metal text rotates K 3x at 3:1 heads (defect)",
+            std::fabs(kl3[0] - (float)std::cos(3.0)) < 1e-6 &&
+            std::fabs(kl3[1] - (float)std::sin(3.0)) < 1e-6);
+    }
   }
   { // rope split: head_dim 4, pos 1, q=[1,0,0,0] at position 1.
     // Arrays hold 2 positions (seq_len 2); the ref indexes
@@ -403,6 +443,28 @@ static void test_norms_rope_kv() {
     kref::stable_softmax_ref(scores, H, 2, 1);
     check("softmax rows sum to 1, tail untouched by len",
           std::fabs(scores[0] + scores[1] - 1.0f) < 1e-6);
+    // REGRESSION (causal mask): attention.metal `causal_mask` is a
+    // no-op as written — `if (pos > spec.offset) return;` precedes
+    // the only write, so it never masks. It was deliberately NOT
+    // ported as a kernel. Causality in this port lives ONLY in
+    // stable_softmax: len = offset+1, entries len..length zeroed.
+    // This test pins that: future positions carry the LARGEST raw
+    // scores (5.0), so without the zero tail they would dominate
+    // the row; with it they must be exactly 0 and the past must
+    // still sum to 1. If this ever fails, prefill attention can
+    // read future tokens.
+    {
+      float s2[4] = {0.0f, 1.0f, 5.0f, 5.0f}; // offset 1: pos 2,3 future
+      kref::stable_softmax_ref(s2, 1, 4, 1);
+      check("causal: future positions zeroed, past sums to 1",
+            s2[2] == 0.0f && s2[3] == 0.0f &&
+            std::fabs(s2[0] + s2[1] - 1.0f) < 1e-6);
+      float s3[4] = {0.0f, 1.0f, 5.0f, 5.0f};
+      kref::stable_softmax_ref(s3, 1, 4, 3); // offset 3: nothing future
+      check("causal: full-length offset keeps all positions",
+            s3[2] != 0.0f && s3[3] != 0.0f &&
+            std::fabs(s3[0] + s3[1] + s3[2] + s3[3] - 1.0f) < 1e-6);
+    }
     float out[8];
     kref::attention_value_ref(scores, vc, out, H, G, D, 2, 1);
     double l = 1.0 + std::exp(-0.5);

@@ -164,14 +164,16 @@ Other divergences, recorded not silently unified:
 ## 5. Verification — actual results
 
 ```
-ctest: 64 tests — 61 passed, 3 skipped (BLOCKED by design), 0 failed
+ctest: 68 tests — 65 passed, 3 skipped (BLOCKED by design), 0 failed
   int4_oracle (Phase B): 31/31 PASS (incl. exhaustive roundtrip of
     all 65,536 half patterns; golden matvec within 5e-7)
-  kernel_ref (Phase C): 83/83 PASS
+  kernel_ref (Phase C): 87/87 PASS (83 + 4 defect regressions, §4)
   spirv-val: 27/27 shaders PASS
   reflection: 27/27 shaders PASS (bindings, push sizes, spec consts)
   golden reproducible: Phase B + Phase C goldens regenerate
     byte-identical
+  manifest reproducible: 1-layer (15 nodes) + 2-layer (26 nodes)
+    manifests regenerate byte-identical
   dispatch: list/caps/embedding/matvec SKIP as BLOCKED
     (BLOCKED_NO_PHYSICAL_DEVICE, exit 3); graph/graph_2layers PASS
     (build + validate only, no execution)
@@ -207,6 +209,24 @@ check originally reused the same x, for which the composed
 output is genuinely identical (identical V rows), so it now uses
 a different x at pos 1.
 
+Defect regression tests (added after the Phase C commit, §4):
+
+- RoPE: "rope literal Metal text rotates K 2x at 2:1 heads
+  (defect)" and "...3x at 3:1 heads (defect)" — a lambda
+  replicating the literal `rope.metal` loop proves the defect is
+  real (K rotated 2x / 3x) and differs from the corrected path,
+  which the existing "rope K rotated once under GQA (not 2x)"
+  test pins. If the literal and corrected results ever agree,
+  the fix has regressed.
+- Causal mask: "causal: future positions zeroed, past sums to 1"
+  — future positions carry the largest raw scores (5.0), so
+  without the zero tail they would dominate the row; with it
+  they are exactly 0 and the past still sums to 1. Plus
+  "causal: full-length offset keeps all positions" (offset 3,
+  nothing future). The corrected semantics are marked as
+  intentional divergence in `softmax.comp`, in
+  `stable_softmax_ref` (`kernel_ref.cpp`), and in §4 above.
+
 ## 6. What is NOT claimed
 
 - No GPU numerical equivalence: dispatch is BLOCKED on this
@@ -217,6 +237,33 @@ a different x at pos 1.
 - No performance claims of any kind.
 - Phase B evidence is untouched: `int4_golden.txt` and all Phase B
   tests pass unchanged.
+
+**The bar for calling the inference engine verified** (owner,
+2026-11-11): actual Vulkan dispatch, GPU readback, numerical
+comparison against the CPU oracle, and at least one completed
+autoregressive decoding sequence. The validated command graph
+establishes structure, not runtime correctness. None of the four
+has happened yet; the graph + CPU references are the preparation
+for them, not a substitute.
+
+## 7. Graph manifest (Karpenthys contract)
+
+`vk_dispatch manifest <layers> <out.json> [spv_dir]` builds the
+graph at model defaults and writes a machine-readable manifest
+(`Vulkan/manifests/graph_manifest_1layer.json`,
+`graph_manifest_2layers.json`, checked in, regeneration-tested
+byte-identical). Each node carries: index, label, layer, shader,
+weight_format, binding_count (set 0, sequential — the property
+reflection verifies for all 27 shaders), buffer byte sizes, push
+bytes, spec constants, workgroup counts, SPIR-V byte size, and
+`validated: true`. Graph-level: dims, caps note, and an honest
+execution block (`dispatched: false, state: NOT_EXECUTED`, with
+the BLOCKED reason). The manifest is the data source for the
+Karpenthys read-only visualizer (`~/workspace/karpenthys/`):
+15-node and 26-node radial graphs, click a node to inspect its
+SPIR-V module, INT4 format, bindings, validation results and
+execution state. No node is invented; no execution is simulated.
+Live animation waits until Vulkan dispatch is demonstrated.
 
 ## 7. Files
 
@@ -231,6 +278,9 @@ a different x at pos 1.
 - `Vulkan/tests/test_kernel_ref.cpp`, `gen_kernel_golden.cpp`,
   `golden/kernel_golden.txt` (new); `check_reflection.cpp`
   (rewritten table-driven, 27 shaders); `test_int4_oracle.cpp`
-  (unchanged); `vk_dispatch.cpp` (new `caps` + `graph` modes)
+  (unchanged); `vk_dispatch.cpp` (new `caps`, `graph`, `manifest`
+  modes)
 - `Vulkan/CMakeLists.txt` (new libraries, 27-shader loop, per-shader
-  spirv-val + reflection tests, kernel golden + dispatch tests)
+  spirv-val + reflection tests, kernel golden + manifest + dispatch tests)
+- `Vulkan/manifests/graph_manifest_1layer.json`,
+  `graph_manifest_2layers.json` (checked-in consumer contract)

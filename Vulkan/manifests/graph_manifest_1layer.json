@@ -1,0 +1,27 @@
+{
+  "manifest_version": 1,
+  "generator": "vk_dispatch manifest (metal-inference Phase C)",
+  "layers": 1,
+  "node_count": 15,
+  "node_count_formula": "4 + 11*layers",
+  "dims": {"hidden": 3072, "intermediate": 8192, "q_heads": 24, "kv_heads": 8, "head_dim": 128, "vocab": 32000, "context": 4096, "seq_len": 1},
+  "caps": {"known": false, "note": "unavailable: vkCreateInstance failed: the Vulkan loader found no usable ICD/driver on this system"},
+  "execution": {"dispatched": false, "state": "NOT_EXECUTED", "reason": "no Vulkan device on this machine (BLOCKED_NO_PHYSICAL_DEVICE); a validated graph is not an executed inference pass"},
+  "nodes": [
+    {"index": 0, "label": "embedding", "layer": -1, "shader": "embedding", "weight_format": "none", "binding_count": 3, "bindings": "set 0, sequential", "buffer_bytes": [196608000, 4, 6144], "push_bytes": 4, "spec_local_size": 256, "spec_group": 0, "groups": [12, 1, 1], "spv_bytes": 1776, "validated": true},
+    {"index": 1, "label": "rmsnorm#attn:L0", "layer": 0, "shader": "rmsnorm", "weight_format": "none", "binding_count": 3, "bindings": "set 0, sequential", "buffer_bytes": [6144, 6144, 6144], "push_bytes": 8, "spec_local_size": 256, "spec_group": 0, "groups": [1, 1, 1], "spv_bytes": 9072, "validated": true},
+    {"index": 2, "label": "fused_qkv:L0", "layer": 0, "shader": "fused_qkv", "weight_format": "C(signed,group64,flat)", "binding_count": 10, "bindings": "set 0, sequential", "buffer_bytes": [5013504, 294912, 1671168, 98304, 1671168, 98304, 6144, 6144, 2048, 2048], "push_bytes": 16, "spec_local_size": 256, "spec_group": 0, "groups": [1, 1, 1], "spv_bytes": 15928, "validated": true},
+    {"index": 3, "label": "rope:L0", "layer": 0, "shader": "rope", "weight_format": "none", "binding_count": 4, "bindings": "set 0, sequential", "buffer_bytes": [6144, 2048, 6144, 2048], "push_bytes": 16, "spec_local_size": 256, "spec_group": 0, "groups": [6, 1, 1], "spv_bytes": 9296, "validated": true},
+    {"index": 4, "label": "kv_store:L0", "layer": 0, "shader": "kv_store", "weight_format": "none", "binding_count": 4, "bindings": "set 0, sequential", "buffer_bytes": [2048, 2048, 8388608, 8388608], "push_bytes": 20, "spec_local_size": 256, "spec_group": 0, "groups": [4, 1, 1], "spv_bytes": 3064, "validated": true},
+    {"index": 5, "label": "gqa_attention:L0", "layer": 0, "shader": "gqa_attention", "weight_format": "none", "binding_count": 4, "bindings": "set 0, sequential", "buffer_bytes": [6144, 8388608, 8388608, 6144], "push_bytes": 28, "spec_local_size": 32, "spec_group": 0, "groups": [1, 1, 1], "spv_bytes": 11348, "validated": true},
+    {"index": 6, "label": "output_projection:L0", "layer": 0, "shader": "int4_matvec_fmt", "weight_format": "A(signed,per-row)", "binding_count": 4, "bindings": "set 0, sequential", "buffer_bytes": [4724736, 6144, 6144, 6144], "push_bytes": 12, "spec_local_size": 256, "spec_group": 0, "groups": [3072, 1, 1], "spv_bytes": 9480, "validated": true},
+    {"index": 7, "label": "residual#attn:L0", "layer": 0, "shader": "residual", "weight_format": "none", "binding_count": 3, "bindings": "set 0, sequential", "buffer_bytes": [6144, 6144, 6144], "push_bytes": 8, "spec_local_size": 256, "spec_group": 0, "groups": [12, 1, 1], "spv_bytes": 6668, "validated": true},
+    {"index": 8, "label": "rmsnorm#ffn:L0", "layer": 0, "shader": "rmsnorm", "weight_format": "none", "binding_count": 3, "bindings": "set 0, sequential", "buffer_bytes": [6144, 6144, 6144], "push_bytes": 8, "spec_local_size": 256, "spec_group": 0, "groups": [1, 1, 1], "spv_bytes": 9072, "validated": true},
+    {"index": 9, "label": "swiglu:L0", "layer": 0, "shader": "swiglu", "weight_format": "A(signed,per-row)", "binding_count": 6, "bindings": "set 0, sequential", "buffer_bytes": [12599296, 16384, 12599296, 16384, 6144, 16384], "push_bytes": 12, "spec_local_size": 256, "spec_group": 0, "groups": [8192, 1, 1], "spv_bytes": 15116, "validated": true},
+    {"index": 10, "label": "mlp_down:L0", "layer": 0, "shader": "int4_matvec_fmt", "weight_format": "A(signed,per-row)", "binding_count": 4, "bindings": "set 0, sequential", "buffer_bytes": [12589056, 6144, 16384, 6144], "push_bytes": 12, "spec_local_size": 256, "spec_group": 0, "groups": [3072, 1, 1], "spv_bytes": 9480, "validated": true},
+    {"index": 11, "label": "residual#ffn:L0", "layer": 0, "shader": "residual", "weight_format": "none", "binding_count": 3, "bindings": "set 0, sequential", "buffer_bytes": [6144, 6144, 6144], "push_bytes": 8, "spec_local_size": 256, "spec_group": 0, "groups": [12, 1, 1], "spv_bytes": 6668, "validated": true},
+    {"index": 12, "label": "final_norm", "layer": -1, "shader": "rmsnorm", "weight_format": "none", "binding_count": 3, "bindings": "set 0, sequential", "buffer_bytes": [6144, 6144, 6144], "push_bytes": 8, "spec_local_size": 256, "spec_group": 0, "groups": [1, 1, 1], "spv_bytes": 9072, "validated": true},
+    {"index": 13, "label": "logits", "layer": -1, "shader": "logits", "weight_format": "A(signed,per-row)", "binding_count": 4, "bindings": "set 0, sequential", "buffer_bytes": [6144, 49216000, 64000, 128000], "push_bytes": 12, "spec_local_size": 256, "spec_group": 0, "groups": [32000, 1, 1], "spv_bytes": 9500, "validated": true},
+    {"index": 14, "label": "argmax", "layer": -1, "shader": "argmax", "weight_format": "none", "binding_count": 2, "bindings": "set 0, sequential", "buffer_bytes": [128000, 4], "push_bytes": 4, "spec_local_size": 32, "spec_group": 0, "groups": [1, 1, 1], "spv_bytes": 1900, "validated": true}
+  ]
+}

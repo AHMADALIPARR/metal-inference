@@ -46,7 +46,7 @@ static int report_blocked(const vkrun::Status& s) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: vk_dispatch list|embedding <spv>|matvec <spv>\n");
+    fprintf(stderr, "usage: vk_dispatch list|caps|graph [layers]|manifest <layers> <out.json> [spv_dir]|embedding <spv>|matvec <spv>\n");
     return 1;
   }
   std::string mode = argv[1];
@@ -101,6 +101,105 @@ int main(int argc, char** argv) {
            g.nodes.size());
     printf("EXECUTION: NOT ATTEMPTED — a validated graph is not an executed "
            "inference pass; dispatch needs a Vulkan device (see list/caps)\n");
+    return 0;
+  }
+  if (mode == "manifest") {
+    // vk_dispatch manifest <layers> <out.json> [spv_dir]
+    // Machine-readable graph manifest: the contract Karpenthys and
+    // any other consumer reads. Only written after a successful
+    // build + validation; self-checked before reporting OK.
+    if (argc < 4) { fprintf(stderr, "usage: vk_dispatch manifest <layers> <out.json> [spv_dir]\n"); return 1; }
+    uint32_t layers = (uint32_t)std::atoi(argv[2]);
+    const char* out_path = argv[3];
+    const char* spv_dir = argc >= 5 ? argv[4] : nullptr;
+    graph::ModelDims dims;
+    graph::Graph g;
+    std::string why;
+    if (!graph::build_forward_graph(dims, layers, 1, g, why)) {
+      printf("FAIL graph build: %s\n", why.c_str());
+      return 1;
+    }
+    auto esc = [](const std::string& s) {
+      std::string o;
+      for (char c : s) {
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if ((unsigned char)c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+        else o += c;
+      }
+      return o;
+    };
+    auto layer_of = [](const std::string& label) -> int {
+      size_t p = label.rfind(":L");
+      if (p == std::string::npos) return -1;
+      return std::atoi(label.c_str() + p + 2);
+    };
+    std::string json;
+    json += "{\n  \"manifest_version\": 1,\n";
+    json += "  \"generator\": \"vk_dispatch manifest (metal-inference Phase C)\",\n";
+    json += "  \"layers\": " + std::to_string(layers) + ",\n";
+    json += "  \"node_count\": " + std::to_string(g.nodes.size()) + ",\n";
+    json += "  \"node_count_formula\": \"4 + 11*layers\",\n";
+    json += "  \"dims\": {\"hidden\": " + std::to_string(dims.hidden) +
+            ", \"intermediate\": " + std::to_string(dims.intermediate) +
+            ", \"q_heads\": " + std::to_string(dims.q_heads) +
+            ", \"kv_heads\": " + std::to_string(dims.kv_heads) +
+            ", \"head_dim\": " + std::to_string(dims.head_dim) +
+            ", \"vocab\": " + std::to_string(dims.vocab) +
+            ", \"context\": " + std::to_string(dims.context) +
+            ", \"seq_len\": 1},\n";
+    json += std::string("  \"caps\": {\"known\": ") + (g.caps_known ? "true" : "false") +
+            ", \"note\": \"" + esc(g.caps_note) + "\"},\n";
+    json += "  \"execution\": {\"dispatched\": false, \"state\": \"NOT_EXECUTED\", "
+            "\"reason\": \"no Vulkan device on this machine "
+            "(BLOCKED_NO_PHYSICAL_DEVICE); a validated graph is not an "
+            "executed inference pass\"},\n";
+    json += "  \"nodes\": [\n";
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+      auto& n = g.nodes[i];
+      std::string spv_size = "null";
+      if (spv_dir) {
+        std::string p = std::string(spv_dir) + "/" + n.shader + ".spv";
+        auto bytes = read_file(p.c_str());
+        if (!bytes.empty()) spv_size = std::to_string(bytes.size());
+      }
+      json += "    {\"index\": " + std::to_string(i) +
+              ", \"label\": \"" + esc(n.label) + "\"" +
+              ", \"layer\": " + std::to_string(layer_of(n.label)) +
+              ", \"shader\": \"" + esc(n.shader) + "\"" +
+              ", \"weight_format\": \"" + esc(tensorabi::format_name(n.weight_format)) + "\"" +
+              ", \"binding_count\": " + std::to_string(n.inputs.size() + n.outputs.size()) +
+              ", \"bindings\": \"set 0, sequential\"" +
+              ", \"buffer_bytes\": [";
+      for (size_t b = 0; b < n.buffer_bytes.size(); ++b) {
+        if (b) json += ", ";
+        json += std::to_string(n.buffer_bytes[b]);
+      }
+      json += "], \"push_bytes\": " + std::to_string(n.push.size()) +
+              ", \"spec_local_size\": " + std::to_string(n.spec_local_size) +
+              ", \"spec_group\": " + std::to_string(n.spec_group) +
+              ", \"groups\": [" + std::to_string(n.groups_x) + ", " +
+              std::to_string(n.groups_y) + ", " + std::to_string(n.groups_z) + "]" +
+              ", \"spv_bytes\": " + spv_size +
+              ", \"validated\": true}" +
+              (i + 1 < g.nodes.size() ? ",\n" : "\n");
+    }
+    json += "  ]\n}\n";
+    {
+      std::ofstream out(out_path, std::ios::binary);
+      if (!out) { fprintf(stderr, "cannot write %s\n", out_path); return 1; }
+      out << json;
+    }
+    // Self-check: re-read and confirm the node count agrees.
+    auto back = read_file(out_path);
+    std::string want = "\"node_count\": " + std::to_string(g.nodes.size());
+    std::string text(back.begin(), back.end());
+    if (text.find(want) == std::string::npos || text.size() < 2 ||
+        text[text.size() - 2] != '}') {
+      fprintf(stderr, "FAIL manifest self-check %s\n", out_path);
+      return 1;
+    }
+    printf("MANIFEST OK %s layers=%u nodes=%zu\n", out_path, layers,
+           g.nodes.size());
     return 0;
   }
   if (argc < 3) { fprintf(stderr, "missing spv path\n"); return 1; }
